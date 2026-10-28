@@ -11,6 +11,18 @@ export const OAUTH_REFRESH_URL = "https://oauth2.googleapis.com/token";
 export const TOKEN_BUFFER_TIME = 5 * 60 * 1000; // 5 minutes in milliseconds
 export const KV_TOKEN_KEY = "oauth_token_cache";
 
+// --- Upstream timeouts and retry limits ---
+export const TOKEN_REFRESH_TIMEOUT_MS = 15 * 1000;
+export const TOKEN_REFRESH_MAX_ATTEMPTS = 3;
+export const MODEL_DISCOVERY_TIMEOUT_MS = 10 * 1000;
+export const PROJECT_DISCOVERY_TIMEOUT_MS = 10 * 1000;
+export const GENERATION_TIMEOUT_MS = 10 * 60 * 1000;
+export const DYNAMIC_MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+export const DYNAMIC_MODEL_STALE_TTL_MS = 24 * 60 * 60 * 1000;
+export const PROJECT_ID_CACHE_TTL_MS = 30 * 60 * 1000;
+export const MAX_RATE_LIMIT_RETRIES = 3;
+export const MAX_RETRY_DELAY_MS = 30 * 1000;
+
 // --- OpenAI API Constants ---
 export const OPENAI_CHAT_COMPLETION_OBJECT = "chat.completion.chunk";
 export const OPENAI_MODEL_OWNER = "google-gemini-cli";

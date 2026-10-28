@@ -7,14 +7,18 @@ import {
 } from "../constants";
 import { ChatCompletionRequest, Env, EffortLevel, SafetyThreshold } from "../types";
 import { NativeToolsConfiguration } from "../types/native-tools";
-
-type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+import {
+	convertSchemaForGemini,
+	selectSchemaProtocol,
+	SchemaProtocol
+} from "./structured-output";
 
 /**
  * Helper class to validate and correct generation configurations for different Gemini models.
  * Handles model-specific limitations and provides sensible defaults.
  */
 export class GenerationConfigValidator {
+
 	/**
 	 * Maps reasoning effort to thinking budget based on model type.
 	 * @param effort - The reasoning effort level
@@ -45,34 +49,6 @@ export class GenerationConfigValidator {
 	 */
 	static isValidEffortLevel(value: unknown): value is EffortLevel {
 		return typeof value === "string" && ["none", "low", "medium", "high"].includes(value);
-	}
-
-	/**
-	 * Recursively cleans a schema object to remove fields not supported by Gemini
-	 * (like keys starting with $, strict, const, etc.)
-	 * @param schema - The schema to clean
-	 * @returns The cleaned schema
-	 */
-	private static cleanSchema(schema: JsonValue): JsonValue {
-		if (!schema || typeof schema !== "object") return schema;
-
-		if (Array.isArray(schema)) {
-			return schema.map((item) => this.cleanSchema(item));
-		}
-
-		const cleaned: { [key: string]: JsonValue } = {};
-		const unsupportedKeys = ["strict", "const", "additionalProperties", "exclusiveMaximum", "exclusiveMinimum"];
-
-		for (const [key, value] of Object.entries(schema)) {
-			// Remove OpenAI/JSON Schema specific fields not supported by Gemini
-			if (key.startsWith("$") || unsupportedKeys.includes(key)) {
-				continue;
-			}
-
-			// Recurse for nested objects (properties, items, etc.)
-			cleaned[key] = this.cleanSchema(value);
-		}
-		return cleaned;
 	}
 
 	/**
@@ -157,13 +133,14 @@ export class GenerationConfigValidator {
 		modelId: string,
 		options: Partial<ChatCompletionRequest> = {},
 		isRealThinkingEnabled: boolean,
-		includeReasoning: boolean
+		includeReasoning: boolean,
+		schemaProtocol: SchemaProtocol = selectSchemaProtocol(modelId)
 	): Record<string, unknown> {
 		const generationConfig: Record<string, unknown> = {
 			temperature: options.temperature ?? DEFAULT_TEMPERATURE,
-			maxOutputTokens: options.max_tokens,
+			maxOutputTokens: options.max_completion_tokens ?? options.max_tokens,
 			topP: options.top_p,
-			stopSequences: typeof options.stop === "string" ? [options.stop] : options.stop,
+			stopSequences: typeof options.stop === "string" ? [options.stop] : options.stop ?? undefined,
 			presencePenalty: options.presence_penalty,
 			frequencyPenalty: options.frequency_penalty,
 			seed: options.seed
@@ -171,6 +148,24 @@ export class GenerationConfigValidator {
 
 		if (options.response_format?.type === "json_object") {
 			generationConfig.responseMimeType = "application/json";
+			// responseMimeType alone is only a strong hint in Gemini. A generic
+			// object schema makes OpenAI's JSON mode contract deterministic.
+			if (schemaProtocol === "responseJsonSchema") {
+				generationConfig.responseJsonSchema = { type: "object" };
+			} else {
+				generationConfig.responseSchema = { type: "OBJECT" };
+			}
+		} else if (options.response_format?.type === "json_schema") {
+			generationConfig.responseMimeType = "application/json";
+			const converted = convertSchemaForGemini(
+				options.response_format.json_schema.schema,
+				schemaProtocol
+			);
+			if (schemaProtocol === "responseJsonSchema") {
+				generationConfig.responseJsonSchema = converted;
+			} else {
+				generationConfig.responseSchema = converted;
+			}
 		}
 
 		const modelInfo = geminiCliModels[modelId];
@@ -180,9 +175,10 @@ export class GenerationConfigValidator {
 			const reasoning_effort =
 				options.reasoning_effort || options.extra_body?.reasoning_effort || options.model_params?.reasoning_effort;
 			const effort = reasoning_effort && this.isValidEffortLevel(reasoning_effort) ? reasoning_effort : "high";
+			const requestedThinkingBudget = options.thinking_budget;
 
 			// Handle Gemini 3.0 series (Pro and Flash) using the new 'thinkingLevel' parameter
-			if (modelId.includes("gemini-3")) {
+			if (modelId.includes("gemini-3") && requestedThinkingBudget === undefined) {
 				const level = (effort === "low" || effort === "none") ? "low" : "high";
 				generationConfig.thinkingConfig = {
 					thinkingLevel: level,
@@ -191,7 +187,7 @@ export class GenerationConfigValidator {
 				console.log(`[GenerationConfig] Real thinking enabled for '${modelId}' with level: '${level}'`);
 			} else {
 				// Handle older models' 'thinkingBudget' parameter
-				const thinkingBudget = this.mapEffortToThinkingBudget(effort, modelId);
+				const thinkingBudget = requestedThinkingBudget ?? this.mapEffortToThinkingBudget(effort, modelId);
 				const validatedBudget = this.validateThinkingBudget(modelId, thinkingBudget);
 				generationConfig.thinkingConfig = {
 					thinkingBudget: validatedBudget,
@@ -212,8 +208,9 @@ export class GenerationConfigValidator {
 		// Add tools configuration if provided
 		if (Array.isArray(options.tools) && options.tools.length > 0) {
 			const functionDeclarations = options.tools.map((tool) => {
-				// Recursively clean the parameters
-				const parameters = this.cleanSchema(tool.function.parameters as JsonValue); // Start the recursion with a cast, as external types might be loose
+				const parameters = tool.function.parameters
+					? convertSchemaForGemini(tool.function.parameters, "responseSchema")
+					: undefined;
 				return {
 					name: tool.function.name,
 					description: tool.function.description,
@@ -228,6 +225,8 @@ export class GenerationConfigValidator {
 					toolConfig = { functionCallingConfig: { mode: "AUTO" } };
 				} else if (options.tool_choice === "none") {
 					toolConfig = { functionCallingConfig: { mode: "NONE" } };
+				} else if (options.tool_choice === "required") {
+					toolConfig = { functionCallingConfig: { mode: "ANY" } };
 				} else if (typeof options.tool_choice === "object" && options.tool_choice.function) {
 					toolConfig = {
 						functionCallingConfig: {

@@ -70,14 +70,16 @@ app.get("/", (c) => {
 	return c.json({
 		name: "Gemini CLI OpenAI Worker",
 		description: "OpenAI-compatible API for Google Gemini models via OAuth",
-		version: "1.0.0",
+		version: "2.0.0",
 		authentication: {
 			required: requiresAuth,
 			type: requiresAuth ? "Bearer token in Authorization header" : "None"
 		},
 		endpoints: {
 			chat_completions: "/v1/chat/completions",
-			models: "/v1/models"
+			completions: "/v1/completions",
+			models: "/v1/models",
+			model: "/v1/models/:model"
 		},
 		documentation: "https://github.com/gewoonjaap/gemini-cli-openai"
 	});

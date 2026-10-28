@@ -1,5 +1,6 @@
 import { Context, Next } from "hono";
 import { Env } from "../types";
+import { safeLogText } from "../utils/redact";
 
 /**
  * Logging middleware for request/response tracking
@@ -23,11 +24,8 @@ export const loggingMiddleware = async (c: Context<{ Bindings: Env }>, next: Nex
 			const clonedReq = c.req.raw.clone();
 			const body = await clonedReq.text();
 
-			// Truncate very long bodies and mask sensitive data
-			const truncatedBody = body.length > 500 ? body.substring(0, 500) + "..." : body;
-			// Mask potential API keys or tokens
-			const maskedBody = truncatedBody.replace(/"(api_?key|token|authorization)":\s*"[^"]*"/gi, '"$1": "***"');
-			bodyLog = ` - Body: ${maskedBody}`;
+			// Redact credentials/media before truncation so secrets cannot leak.
+			bodyLog = ` - Body: ${safeLogText(body, 300)}`;
 		} catch {
 			bodyLog = " - Body: [unable to parse]";
 		}

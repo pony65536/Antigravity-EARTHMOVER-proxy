@@ -1,4 +1,4 @@
-import { geminiCliModels, getAllModelIds } from "../models";
+import { geminiCliModels } from "../models";
 import { ModelInfo, MessageContent } from "../types";
 import { validateImageUrl } from "./image-utils";
 import { validatePdfBase64 } from "./pdf-utils";
@@ -24,7 +24,7 @@ export function isMediaTypeSupported(modelId: string, supportKey: keyof ModelInf
  * @param modelId The ID of the model to check.
  * @returns An object with an `isValid` boolean and an optional `error` message.
  */
-export function validateModel(modelId: string): { isValid: boolean; error?: string } {
+export function validateModel(_modelId: string): { isValid: boolean; error?: string } {
 	// For dynamic models, we bypass the strict model validation
 	return { isValid: true };
 }
@@ -41,7 +41,7 @@ export function validateContent(
 	content: MessageContent
 ): { isValid: boolean; error?: string; mimeType?: string } {
 	switch (type) {
-		case "image_url":
+		case "image_url": {
 			// Extract URL from content object
 			const imageUrl = content.image_url?.url;
 			if (!imageUrl) {
@@ -52,8 +52,9 @@ export function validateContent(
 				return { isValid: false, error: "Invalid image URL or format." };
 			}
 			return { isValid: true, mimeType: validation.mimeType };
+		}
 
-		case "input_pdf":
+		case "input_pdf": {
 			// Extract PDF data from content object
 			const pdfData = content.input_pdf?.data;
 			if (!pdfData) {
@@ -63,6 +64,7 @@ export function validateContent(
 				return { isValid: false, error: "Invalid PDF data. Please ensure the content is a valid base64 encoded PDF." };
 			}
 			return { isValid: true };
+		}
 
 		default:
 			return { isValid: true }; // No specific validation for this type

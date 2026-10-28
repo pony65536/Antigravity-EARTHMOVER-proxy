@@ -6,7 +6,9 @@ compatibility_flags = ["nodejs_compat"]
 
 [vars]
 ENABLE_REAL_THINKING = "true"
-STREAM_THINKING_AS_CONTENT = "true"
+# Keep reasoning out of assistant content. When enabled, thought text is
+# emitted as <think>...</think> inside the normal content field.
+STREAM_THINKING_AS_CONTENT = "false"
 # GEMINI_SAFETY_THRESHOLD = "BLOCK_NONE"
 
 # --- Cloudflare KV Databases ---

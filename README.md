@@ -82,6 +82,33 @@ The proxy will dynamically populate your model dropdown with the actual display 
 
 ---
 
+## V2 API compatibility and reliability
+
+The proxy now exposes both OpenAI completion surfaces:
+
+- `POST /v1/chat/completions` (including streaming, tools, JSON mode, and JSON Schema)
+- `POST /v1/completions` (legacy text completions, streaming and non-streaming)
+- `GET /v1/models` and `GET /v1/models/:model`
+
+V2 adds strict request validation, schema conversion with explicit errors for unsupported keywords, parallel tool calls with preserved IDs, bounded OAuth refresh retries, independent upstream timeouts, per-account model/project caches, `Retry-After` handling, request-ID preservation, and cancellation propagation when the client disconnects.
+
+Two provider-specific notes:
+
+- `max_completion_tokens` maps to Gemini `maxOutputTokens`, which includes thinking tokens. A very small value can therefore produce `finish_reason: "length"` with empty visible content, matching OpenAI reasoning-model behavior.
+- The Code Assist endpoint may return JSON wrapped in a Markdown code fence. For structured-output requests only, the proxy removes a single `json` fence, validates the result against the requested schema, and returns pure JSON to OpenAI clients.
+- Reasoning text is kept out of assistant `content`. Streaming responses expose it separately in both `delta.reasoning` and `delta.reasoning_content`; non-streaming responses expose both `message.reasoning` and `message.reasoning_content` when the upstream provides thought text.
+
+### Testing
+
+```bash
+npm test          # unit + mocked protocol tests, no network
+npm run test:live # opt-in real Gemini integration tests
+```
+
+`test:live` reads credentials from `.dev.vars`, runs a small capped set of real requests, and never writes credentials or response bodies to test artifacts. Optional settings: `LIVE_MODEL`, `LIVE_MAX_REQUESTS`, `LIVE_MAX_TOKENS`, and `LIVE_TIMEOUT_MS`.
+
+---
+
 ## 🎨 Image Generation (SD WebUI API)
 
 EARTHMOVER includes built-in support for image generation using Google's Gemini 3.1 Flash Image model via a standard SD WebUI compatible endpoint.

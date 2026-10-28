@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { Env } from "../types";
 import { AuthManager } from "../auth";
 import { GeminiApiClient } from "../gemini-client";
+import { safeLogText } from "../utils/redact";
 
 /**
  * Debug and testing routes for troubleshooting authentication and API functionality.
@@ -31,8 +32,8 @@ DebugRoute.post("/token-test", async (c) => {
 			message: "Token authentication successful"
 		});
 	} catch (e: unknown) {
-		const errorMessage = e instanceof Error ? e.message : String(e);
-		console.error("Token test error:", e);
+		const errorMessage = safeLogText(e instanceof Error ? e.message : String(e), 1000);
+		console.error("Token test error:", errorMessage);
 		return c.json(
 			{
 				status: "error",
@@ -66,8 +67,8 @@ DebugRoute.post("/test", async (c) => {
 			// Removed actual projectId for security
 		});
 	} catch (e: unknown) {
-		const errorMessage = e instanceof Error ? e.message : String(e);
-		console.error("Test endpoint error:", e);
+		const errorMessage = safeLogText(e instanceof Error ? e.message : String(e), 1000);
+		console.error("Test endpoint error:", errorMessage);
 		return c.json(
 			{
 				status: "error",

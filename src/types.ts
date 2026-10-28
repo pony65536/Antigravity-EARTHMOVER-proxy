@@ -37,6 +37,13 @@ export interface Env {
 	ENABLE_INLINE_CITATIONS?: string; // Enable inline citations in responses (default: false)
 	INCLUDE_GROUNDING_METADATA?: string; // Include grounding metadata in responses (default: true)
 	INCLUDE_SEARCH_ENTRY_POINT?: string; // Include search entry point HTML (default: false)
+
+	// Upstream reliability configuration (values are millisecond strings)
+	GEMINI_TOKEN_REFRESH_TIMEOUT_MS?: string;
+	GEMINI_MODEL_DISCOVERY_TIMEOUT_MS?: string;
+	GEMINI_PROJECT_DISCOVERY_TIMEOUT_MS?: string;
+	GEMINI_GENERATION_TIMEOUT_MS?: string;
+	GEMINI_RESPONSE_SCHEMA_MODE?: "auto" | "responseSchema" | "responseJsonSchema";
 }
 
 // --- Multi-Account Pool Interface ---
@@ -77,6 +84,8 @@ export interface ModelInfo {
 
 // --- Chat Completion Request Interface ---
 export type EffortLevel = "none" | "low" | "medium" | "high";
+export type ChatCompletionFinishReason =
+  "stop" | "length" | "tool_calls" | "content_filter";
 
 export interface Tool {
 	type: "function";
@@ -84,15 +93,24 @@ export interface Tool {
 		name: string;
 		description?: string;
 		parameters?: Record<string, unknown>;
+		strict?: boolean;
 	};
 }
 
-export type ToolChoice = "none" | "auto" | { type: "function"; function: { name: string } };
+export type ToolChoice =
+  | "none"
+  | "auto"
+  | "required"
+  | { type: "function"; function: { name: string } };
 
 export interface ChatCompletionRequest {
 	model: string;
 	messages: ChatMessage[];
 	stream?: boolean;
+  stream_options?: {
+    include_usage?: boolean;
+    include_obfuscation?: boolean;
+  };
 	thinking_budget?: number; // Optional thinking token budget
 	reasoning_effort?: EffortLevel; // Optional effort level for thinking
 	tools?: Tool[];
@@ -113,6 +131,7 @@ export interface ChatCompletionRequest {
 		native_tools_priority?: "native" | "custom" | "mixed";
 	};
 	// Newly added OpenAI parameters
+  max_completion_tokens?: number;
 	max_tokens?: number;
 	temperature?: number;
 	top_p?: number;
@@ -120,9 +139,19 @@ export interface ChatCompletionRequest {
 	presence_penalty?: number;
 	frequency_penalty?: number;
 	seed?: number;
-	response_format?: {
-		type: "text" | "json_object";
-	};
+	response_format?:
+		| { type: "text" }
+		| { type: "json_object" }
+		| {
+				type: "json_schema";
+				json_schema: {
+					name: string;
+					description?: string;
+					schema?: Record<string, unknown>;
+					strict?: boolean;
+				};
+		  };
+  n?: number;
 	// Native Tools flags
 	enable_search?: boolean;
 	enable_url_context?: boolean;
@@ -140,8 +169,8 @@ export interface ToolCall {
 }
 
 export interface ChatMessage {
-	role: string;
-	content: string | MessageContent[];
+  role: "developer" | "system" | "user" | "assistant" | "tool";
+  content: string | MessageContent[] | null;
 	tool_calls?: ToolCall[];
 	tool_call_id?: string;
 }
@@ -188,24 +217,72 @@ export interface ChatCompletionResponse {
 export interface ChatCompletionChoice {
 	index: number;
 	message: ChatCompletionMessage;
-	finish_reason: "stop" | "length" | "tool_calls" | "content_filter" | null;
+  finish_reason: ChatCompletionFinishReason | null;
 }
 
 export interface ChatCompletionMessage {
 	role: "assistant";
 	content: string | null;
-	reasoning_content?: string | null;
 	tool_calls?: ToolCall[];
+	reasoning?: string;
+	reasoning_content?: string;
 }
 
 export interface ChatCompletionUsage {
 	prompt_tokens: number;
 	completion_tokens: number;
 	total_tokens: number;
+	completion_tokens_details?: {
+		reasoning_tokens?: number;
+		tool_use_tokens?: number;
+	};
+	prompt_tokens_details?: {
+		cached_tokens?: number;
+		tool_use_tokens?: number;
+	};
+}
+
+export interface TextCompletionRequest {
+	model?: string;
+	prompt: string | string[] | number[] | number[][];
+	suffix?: string;
+	max_tokens?: number;
+	temperature?: number;
+	top_p?: number;
+	n?: number;
+	stream?: boolean;
+	stream_options?: {
+		include_usage?: boolean;
+	};
+	logprobs?: number | null;
+	echo?: boolean;
+	stop?: string | string[];
+	presence_penalty?: number;
+	frequency_penalty?: number;
+	best_of?: number;
+	seed?: number;
+	user?: string;
+}
+
+export interface TextCompletionChoice {
+	text: string;
+	index: number;
+	logprobs: null;
+	finish_reason: ChatCompletionFinishReason | null;
+}
+
+export interface TextCompletionResponse {
+	id: string;
+	object: "text_completion";
+	created: number;
+	model: string;
+	choices: TextCompletionChoice[];
+	usage?: ChatCompletionUsage;
 }
 
 // --- Gemini Specific Types ---
 export interface GeminiFunctionCall {
+	id?: string;
 	name: string;
 	args: object;
 }
@@ -214,11 +291,26 @@ export interface GeminiFunctionCall {
 export interface UsageData {
 	inputTokens: number;
 	outputTokens: number;
+	reasoningTokens?: number;
+	cachedTokens?: number;
+	toolUseTokens?: number;
+}
+
+export interface StreamErrorData {
+	message: string;
+	type: string;
+	code: string | number | null;
+	param?: string | null;
+	request_id?: string | null;
 }
 
 export interface ReasoningData {
 	reasoning: string;
 	toolCode?: string;
+}
+
+export interface FinishData {
+  reason: ChatCompletionFinishReason;
 }
 
 // --- Stream Chunk Types ---
@@ -231,6 +323,21 @@ export interface StreamChunk {
 		| "real_thinking"
 		| "tool_code"
 		| "native_tool"
-		| "grounding_metadata";
-	data: string | UsageData | ReasoningData | GeminiFunctionCall | NativeToolResponse;
+    | "grounding_metadata"
+    | "finish"
+    | "error";
+  data:
+    | string
+    | UsageData
+    | ReasoningData
+    | GeminiFunctionCall
+    | NativeToolResponse
+    | FinishData
+    | StreamErrorData;
+}
+
+export interface GeminiCompletionOptions extends Partial<ChatCompletionRequest> {
+  includeReasoning?: boolean;
+  showReasoning?: boolean;
+  signal?: AbortSignal;
 }

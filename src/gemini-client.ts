@@ -5,13 +5,23 @@ import {
 	UsageData,
 	ChatMessage,
 	MessageContent,
-	Tool,
-	ToolChoice,
 	GeminiFunctionCall,
-	EffortLevel
+	GeminiCompletionOptions,
+	ChatCompletionFinishReason
 } from "./types";
 import { AuthManager } from "./auth";
-import { CODE_ASSIST_ENDPOINT, CODE_ASSIST_API_VERSION } from "./config";
+import {
+	CODE_ASSIST_ENDPOINT,
+	CODE_ASSIST_API_VERSION,
+	DYNAMIC_MODEL_CACHE_TTL_MS,
+	DYNAMIC_MODEL_STALE_TTL_MS,
+	GENERATION_TIMEOUT_MS,
+	MAX_RATE_LIMIT_RETRIES,
+	MAX_RETRY_DELAY_MS,
+	MODEL_DISCOVERY_TIMEOUT_MS,
+	PROJECT_DISCOVERY_TIMEOUT_MS,
+	PROJECT_ID_CACHE_TTL_MS
+} from "./config";
 import { REASONING_MESSAGES, REASONING_CHUNK_DELAY, THINKING_CONTENT_CHUNK_SIZE } from "./constants";
 import { geminiCliModels } from "./models";
 import { validateContent } from "./utils/validation";
@@ -20,6 +30,18 @@ import { AutoModelSwitchingHelper } from "./helpers/auto-model-switching";
 import { NativeToolsManager } from "./helpers/native-tools-manager";
 import { CitationsProcessor } from "./helpers/citations-processor";
 import { GeminiUrlContextMetadata, GroundingMetadata, NativeToolsRequestParams } from "./types/native-tools";
+import { mapGeminiFinishReason, UpstreamApiError } from "./helpers/openai-compat";
+import { selectSchemaProtocol } from "./helpers/structured-output";
+import {
+	createAbortScope,
+	envTimeoutMs,
+	fetchTextWithTimeout,
+	getUpstreamRequestId,
+	isAbortError,
+	parseRetryAfterMs,
+	sleep
+} from "./utils/http";
+import { safeLogText } from "./utils/redact";
 
 // Gemini API response types
 interface GeminiCandidate {
@@ -27,19 +49,31 @@ interface GeminiCandidate {
 		parts?: Array<{ text?: string }>;
 	};
 	groundingMetadata?: GroundingMetadata;
+	finishReason?: string;
 }
 
 interface GeminiUsageMetadata {
 	promptTokenCount?: number;
 	candidatesTokenCount?: number;
+	thoughtsTokenCount?: number;
+	cachedContentTokenCount?: number;
+	toolUsePromptTokenCount?: number;
 }
 
 interface GeminiResponse {
 	response?: {
 		candidates?: GeminiCandidate[];
 		usageMetadata?: GeminiUsageMetadata;
+		promptFeedback?: {
+			blockReason?: string;
+		};
 	};
 	traceId?: string;
+	error?: {
+		code?: number;
+		message?: string;
+		status?: string;
+	};
 }
 
 export interface GeminiPart {
@@ -98,6 +132,21 @@ interface ProjectDiscoveryResponse {
 	cloudaicompanionProject?: string;
 }
 
+interface DynamicModelCacheEntry {
+	models: Record<string, any>;
+	expiresAt: number;
+	staleUntil: number;
+}
+const dynamicModelsCache = new Map<string, DynamicModelCacheEntry>();
+const dynamicModelsFetchInFlight = new Map<string, Promise<Record<string, any> | null>>();
+const projectIdCache = new Map<string, { value: string | undefined; expiresAt: number }>();
+
+export function clearDynamicModelCaches(): void {
+	dynamicModelsCache.clear();
+	dynamicModelsFetchInFlight.clear();
+	projectIdCache.clear();
+}
+
 // Type guard functions
 function isTextContent(content: MessageContent): content is TextContent {
 	return content.type === "text" && typeof content.text === "string";
@@ -120,29 +169,153 @@ export class GeminiApiClient {
 		this.autoSwitchHelper = new AutoModelSwitchingHelper(env);
 	}
 
-	public async fetchDynamicModels() {
+	private accountCacheKey(): string {
+		return this.authManager.getCurrentAccountId() || "legacy_single_account";
+	}
+
+	private modelDiscoveryTimeoutMs(): number {
+		return envTimeoutMs(
+			this.env as unknown as Record<string, unknown>,
+			"GEMINI_MODEL_DISCOVERY_TIMEOUT_MS",
+			MODEL_DISCOVERY_TIMEOUT_MS
+		);
+	}
+
+	private projectDiscoveryTimeoutMs(): number {
+		return envTimeoutMs(
+			this.env as unknown as Record<string, unknown>,
+			"GEMINI_PROJECT_DISCOVERY_TIMEOUT_MS",
+			PROJECT_DISCOVERY_TIMEOUT_MS
+		);
+	}
+
+	private generationTimeoutMs(): number {
+		return envTimeoutMs(
+			this.env as unknown as Record<string, unknown>,
+			"GEMINI_GENERATION_TIMEOUT_MS",
+			GENERATION_TIMEOUT_MS
+		);
+	}
+
+	public async fetchDynamicModels(): Promise<void> {
 		if (this.dynamicModelMap) return;
-		console.log("[DynamicModels] Attempting to fetch available models from Antigravity...");
-		try {
-			const response = await fetch(`${CODE_ASSIST_ENDPOINT}/${CODE_ASSIST_API_VERSION}:fetchAvailableModels`, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					"Authorization": `Bearer ${this.authManager.getAccessToken()}`,
-					"User-Agent": "antigravity/cli/1.0.2 windows/amd64"
-				},
-				body: "{}"
+
+		const accountKey = this.accountCacheKey();
+		const cached = dynamicModelsCache.get(accountKey);
+		const now = Date.now();
+
+		if (cached && now < cached.expiresAt) {
+			this.dynamicModelMap = cached.models;
+			return;
+		}
+
+		if (cached && now < cached.staleUntil) {
+			this.dynamicModelMap = cached.models;
+			// stale-while-revalidate: serve immediately and refresh in the background
+			void this.refreshDynamicModels(accountKey, true);
+			return;
+		}
+
+		const models = await this.refreshDynamicModels(accountKey, false);
+		if (models) {
+			this.dynamicModelMap = models;
+		} else if (cached) {
+			this.dynamicModelMap = cached.models;
+		}
+	}
+
+	private refreshDynamicModels(
+		accountKey: string,
+		background: boolean
+	): Promise<Record<string, any> | null> {
+		const existing = dynamicModelsFetchInFlight.get(accountKey);
+		if (existing) return existing;
+
+		if (!background) {
+			console.log("[DynamicModels] Fetching available models from Antigravity...");
+		}
+
+		const request = this.fetchModelsFromUpstream(background)
+			.then((models) => {
+				if (models) {
+					const now = Date.now();
+					dynamicModelsCache.set(accountKey, {
+						models,
+						expiresAt: now + DYNAMIC_MODEL_CACHE_TTL_MS,
+						staleUntil: now + DYNAMIC_MODEL_STALE_TTL_MS
+					});
+					console.log(
+						`[DynamicModels] Loaded ${Object.keys(models).length} models for account ${accountKey}.`
+					);
+				}
+				return models;
+			})
+			.catch((error: unknown) => {
+				if (!background) {
+					console.error(
+						`[DynamicModels] Failed to fetch dynamic models: ${safeLogText(String(error))}`
+					);
+				}
+				return null;
+			})
+			.finally(() => {
+				dynamicModelsFetchInFlight.delete(accountKey);
 			});
-			if (response.ok) {
-				const data = await response.json() as any;
-				this.dynamicModelMap = data.models || {};
-				console.log(`[DynamicModels] Successfully loaded ${Object.keys(this.dynamicModelMap || {}).length} models dynamically.`);
-			} else {
-				console.warn(`[DynamicModels] Server rejected the request: HTTP ${response.status} - ${await response.text()}`);
+
+		dynamicModelsFetchInFlight.set(accountKey, request);
+		return request;
+	}
+
+	private async fetchModelsFromUpstream(background: boolean): Promise<Record<string, any> | null> {
+		let accessToken = this.authManager.getAccessToken();
+		if (!accessToken) {
+			await this.authManager.initializeAuth();
+			accessToken = this.authManager.getAccessToken();
+		}
+		if (!accessToken) return null;
+
+		const requestModels = (token: string) =>
+			fetchTextWithTimeout(
+				`${CODE_ASSIST_ENDPOINT}/${CODE_ASSIST_API_VERSION}:fetchAvailableModels`,
+				{
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"Authorization": `Bearer ${token}`,
+						"User-Agent": "antigravity/cli/1.0.2 windows/amd64"
+					},
+					body: "{}"
+				},
+				this.modelDiscoveryTimeoutMs()
+			);
+
+		let { response, text } = await requestModels(accessToken);
+
+		if (response.status === 401) {
+			await this.authManager.clearTokenCache();
+			await this.authManager.initializeAuth();
+			accessToken = this.authManager.getAccessToken();
+			if (!accessToken) return null;
+			({ response, text } = await requestModels(accessToken));
+		}
+
+		if (!response.ok) {
+			if (!background) {
+				console.warn(
+					`[DynamicModels] Server rejected the request: HTTP ${response.status} - ${safeLogText(text, 300)}`
+				);
 			}
-		} catch (e) {
-			const errorMessage = e instanceof Error ? e.message : String(e);
-			console.error(`[DynamicModels] Failed to fetch dynamic models: ${errorMessage}`);
+			return null;
+		}
+
+		try {
+			const data = JSON.parse(text) as { models?: Record<string, any> };
+			return data.models || {};
+		} catch {
+			if (!background) {
+				console.warn("[DynamicModels] Server returned invalid JSON");
+			}
+			return null;
 		}
 	}
 
@@ -161,14 +334,29 @@ export class GeminiApiClient {
 			return this.projectId;
 		}
 
+		const accountKey = this.accountCacheKey();
+		const cached = projectIdCache.get(accountKey);
+		if (cached && cached.expiresAt > Date.now()) {
+			this.projectId = cached.value ?? null;
+			return cached.value;
+		}
+
 		try {
-			const loadResponse = (await this.authManager.callEndpoint("loadCodeAssist", {
-				metadata: { ideType: "ANTIGRAVITY" } 
-			})) as ProjectDiscoveryResponse;
+			const loadResponse = (await this.authManager.callEndpoint(
+				"loadCodeAssist",
+				{ metadata: { ideType: "ANTIGRAVITY" } },
+				{ timeoutMs: this.projectDiscoveryTimeoutMs() }
+			)) as ProjectDiscoveryResponse;
 
 			// Handle both string and object responses for project ID
 			const project = loadResponse.cloudaicompanionProject;
-			const discoveredId = typeof project === "string" ? project : (project as any)?.id;
+			const discoveredId =
+				typeof project === "string" ? project : (project as { id?: string } | undefined)?.id;
+
+			projectIdCache.set(accountKey, {
+				value: discoveredId,
+				expiresAt: Date.now() + PROJECT_ID_CACHE_TTL_MS
+			});
 
 			if (discoveredId) {
 				this.projectId = discoveredId;
@@ -177,8 +365,7 @@ export class GeminiApiClient {
 			console.warn("Project ID discovery returned empty, sending request without project ID.");
 			return undefined;
 		} catch (error: unknown) {
-			const errorMessage = error instanceof Error ? error.message : String(error);
-			console.warn("Failed to discover project ID:", errorMessage);
+			console.warn("Failed to discover project ID:", safeLogText(String(error)));
 			console.warn("Sending request without project ID to let Antigravity handle it.");
 			return undefined;
 		}
@@ -255,10 +442,10 @@ export class GeminiApiClient {
 					currentToolMessage = {
 						role: "tool",
 						_is_merged_tool: true,
-						_tool_responses: [{ name: realFunctionName, content: msg.content }]
+						_tool_responses: [{ id: msg.tool_call_id, name: realFunctionName, content: msg.content }]
 					};
 				} else {
-					currentToolMessage._tool_responses.push({ name: realFunctionName, content: msg.content });
+					currentToolMessage._tool_responses.push({ id: msg.tool_call_id, name: realFunctionName, content: msg.content });
 				}
 			} else {
 				if (currentToolMessage) {
@@ -275,42 +462,67 @@ export class GeminiApiClient {
 	/**
 	 * Parses a server-sent event (SSE) stream from the Gemini API.
 	 */
+	private parseSSEPayload(payload: string): GeminiResponse | null {
+		const trimmed = payload.trim();
+		if (!trimmed || trimmed === "[DONE]") return null;
+		try {
+			return JSON.parse(trimmed) as GeminiResponse;
+		} catch {
+			throw new UpstreamApiError(
+				502,
+				"Upstream returned a malformed SSE event",
+				undefined,
+				{ code: "malformed_sse" }
+			);
+		}
+	}
+
 	private async *parseSSEStream(stream: ReadableStream<Uint8Array>): AsyncGenerator<GeminiResponse> {
 		const reader = stream.pipeThrough(new TextDecoderStream()).getReader();
 		let buffer = "";
 		let objectBuffer = "";
 
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) {
-				if (objectBuffer) {
-					try {
-						yield JSON.parse(objectBuffer);
-					} catch (e) {
-						console.error("Error parsing final SSE JSON object:", e);
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) {
+					const finalLine = buffer.trim();
+					if (finalLine.startsWith("data:")) {
+						objectBuffer += finalLine.substring(5).trimStart();
 					}
-				}
-				break;
-			}
-
-			buffer += value;
-			const lines = buffer.split("\n");
-			buffer = lines.pop() || ""; // Keep the last, possibly incomplete, line.
-
-			for (const line of lines) {
-				if (line.trim() === "") {
 					if (objectBuffer) {
-						try {
-							yield JSON.parse(objectBuffer);
-						} catch (e) {
-							console.error("Error parsing SSE JSON object:", e);
-						}
-						objectBuffer = "";
+						const parsed = this.parseSSEPayload(objectBuffer);
+						if (parsed) yield parsed;
 					}
-				} else if (line.startsWith("data: ")) {
-					objectBuffer += line.substring(6);
+					break;
+				}
+
+				buffer += value;
+				const lines = buffer.split("\n");
+				buffer = lines.pop() || ""; // Keep the last, possibly incomplete, line.
+
+				for (const line of lines) {
+					if (line.trim() === "") {
+						if (objectBuffer) {
+							const parsed = this.parseSSEPayload(objectBuffer);
+							objectBuffer = "";
+							if (parsed) yield parsed;
+						}
+					} else if (line.startsWith("data:")) {
+						objectBuffer += line.substring(5).trimStart();
+						if (objectBuffer.length > 16 * 1024 * 1024) {
+							throw new UpstreamApiError(
+								502,
+								"Upstream SSE event exceeded the maximum supported size",
+								undefined,
+								{ code: "sse_event_too_large" }
+							);
+						}
+					}
 				}
 			}
+		} finally {
+			reader.releaseLock();
 		}
 	}
 
@@ -329,6 +541,7 @@ export class GeminiApiClient {
 				for (const response of (msg as any)._tool_responses) {
 					parts.push({
 						functionResponse: {
+							id: response.id,
 							name: response.name || "unknown_function",
 							response: {
 								result: typeof response.content === "string" ? response.content : JSON.stringify(response.content)
@@ -340,6 +553,7 @@ export class GeminiApiClient {
 				// Single tool response
 				parts.push({
 					functionResponse: {
+						id: msg.tool_call_id,
 						name: msg.tool_call_id || "unknown_function",
 						response: {
 							result: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
@@ -365,6 +579,7 @@ export class GeminiApiClient {
 				if (toolCall.type === "function") {
 					parts.push({
 						functionCall: {
+							id: toolCall.id,
 							name: toolCall.function.name,
 							args: JSON.parse(toolCall.function.arguments)
 						},
@@ -518,23 +733,7 @@ export class GeminiApiClient {
 		modelId: string,
 		systemPrompt: string,
 		messages: ChatMessage[],
-		options?: {
-			includeReasoning?: boolean;
-			reasoning_effort?: EffortLevel;
-			tools?: Tool[];
-			tool_choice?: ToolChoice;
-			max_tokens?: number;
-			temperature?: number;
-			top_p?: number;
-			stop?: string | string[];
-			presence_penalty?: number;
-			frequency_penalty?: number;
-			seed?: number;
-			response_format?: {
-				type: "text" | "json_object";
-			};
-			showReasoning?: boolean;
-		} & NativeToolsRequestParams
+		options?: GeminiCompletionOptions
 	): AsyncGenerator<StreamChunk> {
 		await this.authManager.initializeAuth(modelId);
 		await this.fetchDynamicModels();
@@ -564,14 +763,6 @@ export class GeminiApiClient {
 		const includeReasoning = options?.includeReasoning || false;
 		const showReasoning = options?.showReasoning ?? true;
 
-		// Use the validation helper to create a proper generation config
-		const generationConfig = GenerationConfigValidator.createValidatedConfig(
-			modelId,
-			options,
-			isRealThinkingEnabled,
-			includeReasoning
-		);
-
 		// Native tools integration
 		const nativeToolsManager = new NativeToolsManager(this.env);
 		const nativeToolsParams = this.extractNativeToolsParams(options as Record<string, unknown>);
@@ -593,18 +784,25 @@ export class GeminiApiClient {
 		let finalModelEnum = "MODEL_PLACEHOLDER_M0";
 		let customThinkingBudget = 1000;
 		let finalModelId = modelId;
+		let hasDynamicThinkingBudget = false;
 
 		if (this.dynamicModelMap) {
 			const dModel = this.dynamicModelMap[modelId];
 			if (dModel) {
 				if (dModel.model) finalModelEnum = dModel.model;
-				if (dModel.thinkingBudget) customThinkingBudget = dModel.thinkingBudget;
+				if (dModel.thinkingBudget !== undefined) {
+					customThinkingBudget = dModel.thinkingBudget;
+					hasDynamicThinkingBudget = true;
+				}
 			} else {
 				for (const [key, value] of Object.entries(this.dynamicModelMap)) {
 					if ((value as any).displayName === modelId) {
 						finalModelId = key;
 						if ((value as any).model) finalModelEnum = (value as any).model;
-						if ((value as any).thinkingBudget) customThinkingBudget = (value as any).thinkingBudget;
+						if ((value as any).thinkingBudget !== undefined) {
+							customThinkingBudget = (value as any).thinkingBudget;
+							hasDynamicThinkingBudget = true;
+						}
 						// Skip deprecated models like M37 and keep looking for the active one (M16)
 						if (finalModelEnum !== "MODEL_PLACEHOLDER_M37") {
 							break;
@@ -619,22 +817,27 @@ export class GeminiApiClient {
 				finalModelId = "claude-opus-4-6-thinking";
 				finalModelEnum = "MODEL_PLACEHOLDER_M26";
 				customThinkingBudget = 1024;
+				hasDynamicThinkingBudget = true;
 			} else if (modelId === "claude-sonnet-4-6-thinking" || modelId === "Claude Sonnet 4.6 (Thinking)") {
 				finalModelId = "claude-sonnet-4-6-thinking";
 				finalModelEnum = "MODEL_PLACEHOLDER_M35";
 				customThinkingBudget = 1024;
+				hasDynamicThinkingBudget = true;
 			} else if (modelId === "gemini-3.5-flash-extra-low" || modelId === "Gemini 3.5 Flash (Low)") {
 				finalModelId = "gemini-3.5-flash-extra-low";
 				finalModelEnum = "MODEL_PLACEHOLDER_M187";
 				customThinkingBudget = 4000; // Matches dump budget for Low
+				hasDynamicThinkingBudget = true;
 			} else if (modelId === "gemini-3.5-flash-medium" || modelId === "Gemini 3.5 Flash (Medium)") {
 				finalModelId = "gemini-3.5-flash-low"; // Key from dynamic dump
 				finalModelEnum = "MODEL_PLACEHOLDER_M20";
 				customThinkingBudget = 4000;
+				hasDynamicThinkingBudget = true;
 			} else if (modelId === "gemini-3.5-flash-high" || modelId === "Gemini 3.5 Flash (High)") {
 				finalModelId = "gemini-3-flash-agent";
 				finalModelEnum = "MODEL_PLACEHOLDER_M132";
 				customThinkingBudget = 10000;
+				hasDynamicThinkingBudget = true;
 			} else if (modelId === "gpt-oss-120b-medium" || modelId === "GPT-OSS 120B (Medium)") {
 				finalModelId = "gpt-oss-120b-medium";
 				finalModelEnum = "MODEL_OPENAI_GPT_OSS_120B_MEDIUM";
@@ -643,15 +846,36 @@ export class GeminiApiClient {
 		}
 
 		const isNewModel = finalModelId.includes("3.6") || finalModelId.includes("3.7") || finalModelEnum === "MODEL_PLACEHOLDER_M73";
-		const maxTokens = isNewModel ? 65536 : 16384;
-
-		const finalGenerationConfig = {
-			maxOutputTokens: maxTokens,
-			thinkingConfig: {
-				includeThoughts: true,
-				thinkingBudget: customThinkingBudget
-			}
+		const defaultMaxTokens = geminiCliModels[finalModelId]?.maxTokens ?? (isNewModel ? 65536 : 16384);
+		const generationConfig = GenerationConfigValidator.createValidatedConfig(
+			finalModelId,
+			options,
+			isRealThinkingEnabled,
+			includeReasoning,
+			selectSchemaProtocol(finalModelId, this.env.GEMINI_RESPONSE_SCHEMA_MODE)
+		);
+		const finalGenerationConfig: Record<string, unknown> = {
+			...generationConfig,
+			maxOutputTokens: Math.min(options?.max_completion_tokens ?? options?.max_tokens ?? defaultMaxTokens, defaultMaxTokens)
 		};
+		const requestedReasoningEffort =
+			options?.reasoning_effort || options?.extra_body?.reasoning_effort || options?.model_params?.reasoning_effort;
+		const hasExplicitThinkingControl = options?.thinking_budget !== undefined || requestedReasoningEffort !== undefined;
+		const supportsThinking = geminiCliModels[finalModelId]?.thinking === true || hasDynamicThinkingBudget;
+		const fallbackThinkingBudget =
+			options?.thinking_budget ??
+			(requestedReasoningEffort && GenerationConfigValidator.isValidEffortLevel(requestedReasoningEffort)
+				? GenerationConfigValidator.mapEffortToThinkingBudget(requestedReasoningEffort, finalModelId)
+				: customThinkingBudget);
+
+		if (!includeReasoning || !isRealThinkingEnabled || !supportsThinking) {
+			delete finalGenerationConfig.thinkingConfig;
+		} else if (!hasExplicitThinkingControl || finalGenerationConfig.thinkingConfig === undefined) {
+			finalGenerationConfig.thinkingConfig = {
+				includeThoughts: true,
+				thinkingBudget: fallbackThinkingBudget
+			};
+		}
 
 		const conversationId = crypto.randomUUID();
 		const trajectoryId = crypto.randomUUID();
@@ -775,7 +999,9 @@ export class GeminiApiClient {
 			includeReasoning && streamThinkingAsContent,
 			showReasoning,
 			modelId,
-			nativeToolsManager
+			nativeToolsManager,
+			0,
+			options?.signal
 		);
 	}
 
@@ -885,26 +1111,52 @@ export class GeminiApiClient {
 		showReasoning: boolean = true, // Add showReasoning parameter, default to true
 		originalModel?: string,
 		nativeToolsManager?: NativeToolsManager,
-		retryCount: number = 0
+		retryCount: number = 0,
+		signal?: AbortSignal
 	): AsyncGenerator<StreamChunk> {
 		const citationsProcessor = new CitationsProcessor(this.env);
-		const response = await fetch(`${CODE_ASSIST_ENDPOINT}/${CODE_ASSIST_API_VERSION}:streamGenerateContent?alt=sse`, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				"Authorization": `Bearer ${this.authManager.getAccessToken()}`,
-				"User-Agent": "antigravity/cli/1.0.2 windows/amd64"
-			},
-			body: JSON.stringify(streamRequest)
-		});
+		// Keep the abort scope alive for the whole SSE body so client
+		// disconnects immediately cancel the upstream generation.
+		const abortScope = createAbortScope(this.generationTimeoutMs(), signal);
+		let response: Response;
+		try {
+			response = await fetch(
+				`${CODE_ASSIST_ENDPOINT}/${CODE_ASSIST_API_VERSION}:streamGenerateContent?alt=sse`,
+				{
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"Authorization": `Bearer ${this.authManager.getAccessToken()}`,
+						"User-Agent": "antigravity/cli/1.0.2 windows/amd64"
+					},
+					body: JSON.stringify(streamRequest),
+					signal: abortScope.signal
+				}
+			);
+		} catch (error: unknown) {
+			abortScope.cleanup();
+			if (signal?.aborted) throw error;
+			if (isAbortError(error)) {
+				throw new UpstreamApiError(
+					504,
+					"Upstream generation timed out",
+					undefined,
+					{ code: "upstream_timeout" }
+				);
+			}
+			throw error;
+		}
 
 		if (!response.ok) {
 			const errorText = await response.text();
+			abortScope.cleanup();
+			const requestId = getUpstreamRequestId(response.headers, errorText);
+			const retryAfterMs = parseRetryAfterMs(response.headers, errorText);
 
 			if (response.status === 401 && !isRetry) {
-				console.log("Got 401 error in stream request, clearing token cache and retrying...");
+				console.log("Got 401 error in stream request, refreshing credentials once...");
 				await this.authManager.clearTokenCache();
-				await this.authManager.initializeAuth();
+				await this.authManager.initializeAuth(originalModel);
 				yield* this.performStreamRequest(
 					streamRequest,
 					needsThinkingClose,
@@ -913,7 +1165,8 @@ export class GeminiApiClient {
 					showReasoning,
 					originalModel,
 					nativeToolsManager,
-					retryCount
+					retryCount,
+					signal
 				); // Retry once
 				return;
 			}
@@ -956,7 +1209,12 @@ export class GeminiApiClient {
 					if (isRetry) {
 						// If we already hot-swapped and the new account is ALSO exhausted, the pool is dead.
 						console.error(`[GeminiAPI] FATAL: All accounts in pool exhausted for ${originalModel}.`);
-						throw new Error(`429 - [EARTHMOVER FATAL] ALL accounts in your pool have exhausted their quotas for this model! Please add more burner accounts using 'node scripts/add-account.js' or wait for the reset.`);
+						throw new UpstreamApiError(
+							429,
+							"All configured accounts have exhausted their quotas for this model.",
+							safeLogText(errorText, 2000),
+							{ requestId, retryAfterMs, code: "quota_exhausted" }
+						);
 					}
 
 					console.log(`[GeminiAPI] QUOTA EXHAUSTED for model ${originalModel}. Reset in ${quotaResetDelaySeconds}s.`);
@@ -977,7 +1235,8 @@ export class GeminiApiClient {
 						showReasoning,
 						originalModel,
 						nativeToolsManager,
-						retryCount
+						retryCount,
+						signal
 					);
 					return;
 				}
@@ -1009,26 +1268,23 @@ export class GeminiApiClient {
 						showReasoning,
 						originalModel,
 						nativeToolsManager,
-						0 // Reset retry count for the new model
+						0, // Reset retry count for the new model
+						signal
 					);
 					return;
 				}
 			}
 
 			// Handle transient 429/499 rate limits with delay (Agent/Tool call rapid requests)
-			if ((response.status === 429 || response.status === 499) && retryCount < 5) {
-				// Match variations like "Please retry in 1.5s" or "Your quota will reset after 1s."
-				const match = errorText.match(/(?:retry in|reset after) ([\d.]+)s/);
-				// Exponential backoff fallback: 2s, 4s, 8s, 16s, 32s (More conservative)
-				let delayMs = Math.pow(2, retryCount + 1) * 1000; 
-				
-				if (match && match[1]) {
-					// Add a 500ms buffer to whatever Google suggests to be safe
-					delayMs = (parseFloat(match[1]) * 1000) + 500;
-				}
-				
-				console.log(`[GeminiAPI] Rate limited (${response.status}). Waiting ${delayMs.toFixed(0)}ms before retrying (Attempt ${retryCount + 1}/5)...`);
-				await new Promise(resolve => setTimeout(resolve, delayMs));
+			if ((response.status === 429 || response.status === 499) && retryCount < MAX_RATE_LIMIT_RETRIES) {
+				const delayMs = Math.min(
+					retryAfterMs ?? Math.pow(2, retryCount) * 1000,
+					MAX_RETRY_DELAY_MS
+				);
+				console.log(
+					`[GeminiAPI] Rate limited (${response.status}). Waiting ${delayMs}ms before retrying (Attempt ${retryCount + 1}/${MAX_RATE_LIMIT_RETRIES})...`
+				);
+				await sleep(delayMs);
 				
 				yield* this.performStreamRequest(
 					streamRequest,
@@ -1038,41 +1294,54 @@ export class GeminiApiClient {
 					showReasoning,
 					originalModel,
 					nativeToolsManager,
-					retryCount + 1
+					retryCount + 1,
+					signal
 				);
 				return;
 			}
 
-			console.error(`[GeminiAPI] Stream request failed: ${response.status}`, errorText);
-			throw new Error(`Stream request failed: ${response.status} - ${errorText}`);
+			console.error(
+				`[GeminiAPI] Stream request failed: ${response.status}`,
+				safeLogText(errorText, 2000)
+			);
+			throw new UpstreamApiError(
+				response.status,
+				`Upstream request failed with status ${response.status}`,
+				safeLogText(errorText, 2000),
+				{ requestId, retryAfterMs }
+			);
 		}
 
 		if (!response.body) {
-			throw new Error("Response has no body");
+			abortScope.cleanup();
+			throw new UpstreamApiError(502, "Upstream response has no body", undefined, {
+				code: "empty_upstream_body"
+			});
 		}
 
 		let hasClosedThinking = false;
 		let hasStartedThinking = false;
 		let isThinking = false; // Track if we are currently in a thinking block
-		let hasFunctionCall = false; // Track if any tool was called
 
-		const startTime = Date.now();
-		let firstChunkTime: number | null = null;
-		let traceId: string | undefined = undefined;
-		const activeProjectId = (streamRequest as any)?.project || "default-project";
-		
-		let fullGeneratedText = "";
-		let citationsCount = 0;
-
+		try {
 		for await (const jsonData of this.parseSSEStream(response.body)) {
-			if (!firstChunkTime) firstChunkTime = Date.now();
-			if (!traceId && jsonData.traceId) traceId = jsonData.traceId;
+			if (jsonData.error) {
+				const upstreamStatus =
+					typeof jsonData.error.code === "number" && jsonData.error.code >= 400
+						? jsonData.error.code
+						: 502;
+				throw new UpstreamApiError(
+					upstreamStatus,
+					jsonData.error.message || "Upstream stream returned an error",
+					undefined,
+					{
+						code: jsonData.error.status || "upstream_stream_error",
+						requestId: jsonData.traceId
+					}
+				);
+			}
 
 			const candidate = jsonData.response?.candidates?.[0];
-
-			if (candidate?.groundingMetadata && candidate.groundingMetadata.groundingChunks) {
-				citationsCount += candidate.groundingMetadata.groundingChunks.length;
-			}
 
 			if (candidate?.content?.parts) {
 				for (const part of candidate.content.parts as GeminiPart[]) {
@@ -1161,7 +1430,7 @@ export class GeminiApiClient {
 										if (hasStartedThinking && !hasClosedThinking) {
 											yield {
 												type: "thinking_content",
-												data: "\n<\/think>\n\n"
+										data: "\n</think>\n\n"
 											};
 											hasClosedThinking = true;
 										}
@@ -1217,14 +1486,12 @@ export class GeminiApiClient {
 						if ((needsThinkingClose || (realThinkingAsContent && hasStartedThinking)) && !hasClosedThinking) {
 							yield {
 								type: "thinking_content",
-								data: "\n<\/think>\n\n"
+								data: "\n</think>\n\n"
 							};
 							hasClosedThinking = true;
 						}
 
 						let processedText = part.text;
-						fullGeneratedText += processedText; // Accumulate text for code detection
-
 						if (nativeToolsManager) {
 							processedText = citationsProcessor.processChunk(
 								part.text,
@@ -1235,20 +1502,19 @@ export class GeminiApiClient {
 					}
 					// Handle function calls from Gemini
 					else if (part.functionCall) {
-						hasFunctionCall = true; // Flag that a tool was used (likely for coding)
-						
 						// Close thinking tag before function call if needed
 						if ((needsThinkingClose || (realThinkingAsContent && hasStartedThinking)) && !hasClosedThinking) {
 							yield {
 								type: "thinking_content",
-									data: "\n<\/think>\n\n"
+									data: "\n</think>\n\n"
 							};
 							hasClosedThinking = true;
 						}
 
 						const functionCallData: GeminiFunctionCall = {
+							id: part.functionCall.id,
 							name: part.functionCall.name,
-							args: part.functionCall.args
+							args: part.functionCall.args ?? {}
 						};
 
 						yield {
@@ -1258,19 +1524,28 @@ export class GeminiApiClient {
 					}
 					// Note: Skipping unknown part structures
 				}
-			} else if ((candidate as any)?.finishReason) {
-				const finishReason = (candidate as any).finishReason;
-				// If we get a finish reason but no content, output it so the user isn't left with an empty 200 OK
-				if (finishReason !== "STOP" && finishReason !== "MAX_TOKENS") {
-					yield { type: "text", data: `\n\n[Google API blocked this response. Finish Reason: ${finishReason}]` };
-				}
+			}
+
+			if (candidate?.finishReason) {
+				yield { type: "finish", data: { reason: mapGeminiFinishReason(candidate.finishReason) } };
+			} else if (jsonData.response?.promptFeedback?.blockReason) {
+				const mapped = mapGeminiFinishReason(
+					jsonData.response.promptFeedback.blockReason
+				);
+				yield {
+					type: "finish",
+					data: { reason: mapped === "stop" ? "content_filter" : mapped }
+				};
 			}
 
 			if (jsonData.response?.usageMetadata) {
 				const usage = jsonData.response.usageMetadata;
 				const usageData: UsageData = {
 					inputTokens: usage.promptTokenCount || 0,
-					outputTokens: usage.candidatesTokenCount || 0
+					outputTokens: (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0),
+					reasoningTokens: usage.thoughtsTokenCount || undefined,
+					cachedTokens: usage.cachedContentTokenCount || undefined,
+					toolUseTokens: usage.toolUsePromptTokenCount || undefined
 				};
 				yield {
 					type: "usage",
@@ -1278,16 +1553,19 @@ export class GeminiApiClient {
 				};
 			}
 		}
-
-		// Calculate final latencies and send telemetry in the background
-		const endTime = Date.now();
-		const totalLatency = endTime - startTime;
-		const actualFirstChunkTime = firstChunkTime || endTime;
-		const firstLatency = actualFirstChunkTime - startTime;
-		
-		const includedCode = hasFunctionCall || fullGeneratedText.includes("```");
-
-		// Telemetry explicitly removed to match official opt-out behavior
+		} catch (error: unknown) {
+			if (!signal?.aborted && abortScope.didTimeout()) {
+				throw new UpstreamApiError(
+					504,
+					"Upstream generation timed out",
+					undefined,
+					{ code: "upstream_timeout" }
+				);
+			}
+			throw error;
+		} finally {
+			abortScope.cleanup();
+		}
 	}
 
 	/**
@@ -1297,91 +1575,90 @@ export class GeminiApiClient {
 		modelId: string,
 		systemPrompt: string,
 		messages: ChatMessage[],
-		options?: {
-			includeReasoning?: boolean;
-			reasoning_effort?: EffortLevel;
-			tools?: Tool[];
-			tool_choice?: ToolChoice;
-			max_tokens?: number;
-			temperature?: number;
-			top_p?: number;
-			stop?: string | string[];
-			presence_penalty?: number;
-			frequency_penalty?: number;
-			seed?: number;
-			response_format?: {
-				type: "text" | "json_object";
-			};
-			showReasoning?: boolean;
-		} & NativeToolsRequestParams
+		options?: GeminiCompletionOptions
 	): Promise<{
 		content: string;
 		usage?: UsageData;
 		tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>;
 		reasoning?: string;
+		reasoning_content?: string;
+		finish_reason?: ChatCompletionFinishReason;
 	}> {
 		try {
 			let content = "";
-			let reasoning = "";
+			let reasoningContent = "";
 			let usage: UsageData | undefined;
+			let finishReason: ChatCompletionFinishReason | undefined;
 			const tool_calls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
 
-			// Collect all chunks from the stream
+			// Collect all chunks from the stream. Thinking/reasoning chunks are
+			// kept separate from assistant content.
 			for await (const chunk of this.streamContent(modelId, systemPrompt, messages, options)) {
 				if (chunk.type === "text" && typeof chunk.data === "string") {
 					content += chunk.data;
-				} else if (chunk.type === "thinking_content" && typeof chunk.data === "string") {
-					reasoning += chunk.data;
-				} else if (chunk.type === "real_thinking" && typeof chunk.data === "string") {
-					reasoning += chunk.data;
-				} else if (chunk.type === "reasoning") {
-					if (typeof chunk.data === "string") {
-						reasoning += chunk.data;
-					} else if (typeof chunk.data === "object" && chunk.data !== null && "reasoning" in chunk.data) {
-						reasoning += (chunk.data as any).reasoning || "";
+				} else if (
+					(chunk.type === "real_thinking" || chunk.type === "thinking_content") &&
+					typeof chunk.data === "string"
+				) {
+					reasoningContent += chunk.data;
+				} else if (chunk.type === "reasoning" && typeof chunk.data === "object" && chunk.data !== null) {
+					const reasoningData = chunk.data as ReasoningData;
+					if (typeof reasoningData.reasoning === "string") {
+						reasoningContent += reasoningData.reasoning;
 					}
 				} else if (chunk.type === "usage" && typeof chunk.data === "object") {
 					usage = chunk.data as UsageData;
 				} else if (chunk.type === "tool_code" && typeof chunk.data === "object") {
 					const toolData = chunk.data as GeminiFunctionCall;
 					tool_calls.push({
-						id: `call_${crypto.randomUUID()}`,
+						id: toolData.id || `call_${crypto.randomUUID()}`,
 						type: "function",
 						function: {
 							name: toolData.name,
-							arguments: JSON.stringify(toolData.args)
+							arguments: JSON.stringify(toolData.args ?? {})
 						}
 					});
+				} else if (chunk.type === "finish" && typeof chunk.data === "object" && "reason" in chunk.data) {
+					finishReason = chunk.data.reason;
 				}
 			}
 
-			// Clean any inline <think> tags from content in non-streaming mode
+			// Clean any inline <think> tags from content in non-streaming mode.
 			if (content.includes("<think>")) {
 				const thinkMatches = Array.from(content.matchAll(/<think>([\s\S]*?)<\/think>/g));
-				if (thinkMatches.length > 0 && !reasoning) {
-					reasoning = thinkMatches.map((m) => m[1].trim()).join("\n\n");
+				if (thinkMatches.length > 0 && !reasoningContent) {
+					reasoningContent = thinkMatches.map((match) => match[1].trim()).join("\n\n");
 				}
 				content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim();
 			}
 
-			// Also clean any unclosed <think> or leftover tags
+			// Also clean any unclosed <think> or leftover tags.
 			if (content.includes("<think>")) {
 				const parts = content.split("<think>");
 				content = parts[0].trim();
-				if (!reasoning && parts[1]) {
-					reasoning = parts[1].replace(/<\/think>/g, "").trim();
+				if (!reasoningContent && parts[1]) {
+					reasoningContent = parts[1].replace(/<\/think>/g, "").trim();
 				}
 			}
 
-			if (reasoning) {
-				reasoning = reasoning.replace(/<\/?think>/g, "").trim();
-			}
+			const resolvedFinishReason =
+				finishReason === "length" || finishReason === "content_filter"
+					? finishReason
+					: tool_calls.length > 0
+						? "tool_calls"
+						: finishReason ?? "stop";
+
+			const cleanedReasoning = reasoningContent
+				.replace(/<\/?think>/gi, "")
+				.trim();
 
 			return {
 				content,
-				reasoning: reasoning || undefined,
+				reasoning: cleanedReasoning || undefined,
+				reasoning_content: cleanedReasoning || undefined,
 				usage,
-				tool_calls: tool_calls.length > 0 ? tool_calls : undefined
+				tool_calls: tool_calls.length > 0 ? tool_calls : undefined,
+				finish_reason: resolvedFinishReason
 			};
 		} catch (error: unknown) {
 			// Handle rate limiting for non-streaming requests

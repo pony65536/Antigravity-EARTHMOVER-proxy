@@ -3,6 +3,7 @@ import { Env } from "../types";
 import { AuthManager } from "../auth";
 import { CODE_ASSIST_ENDPOINT, CODE_ASSIST_API_VERSION } from "../config";
 import { GeminiApiClient } from "../gemini-client";
+import { safeLogText } from "../utils/redact";
 
 export const SdapiRoute = new Hono<{ Bindings: Env }>();
 
@@ -90,8 +91,8 @@ SdapiRoute.post("/v1/txt2img", async (c) => {
 
 		if (!response.ok) {
 			const errorText = await response.text();
-			console.error("Image generation failed:", errorText);
-			return c.json({ error: `Image generation failed: ${response.status} ${errorText}` }, response.status as any);
+			console.error("Image generation failed:", safeLogText(errorText, 1000));
+			return c.json({ error: `Image generation failed: ${response.status} ${safeLogText(errorText, 1000)}` }, response.status as any);
 		}
 
 		const data = await response.json() as any;
@@ -126,7 +127,7 @@ SdapiRoute.post("/v1/txt2img", async (c) => {
 			info: info
 		});
 	} catch (e: unknown) {
-		const errorMessage = e instanceof Error ? e.message : String(e);
+		const errorMessage = safeLogText(e instanceof Error ? e.message : String(e), 1000);
 		console.error("txt2img error:", errorMessage);
 		return c.json({ error: errorMessage }, 500);
 	}

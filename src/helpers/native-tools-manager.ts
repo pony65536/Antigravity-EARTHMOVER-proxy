@@ -32,8 +32,15 @@ export class NativeToolsManager {
 		requestParams: NativeToolsRequestParams,
 		modelId: string
 	): NativeToolsConfiguration {
-		// Handle disabled native tools
-		if (!this.envSettings.enableNativeTools) {
+		const requestOptedIn =
+			this.envSettings.allowRequestControl &&
+			(requestParams.enableNativeTools === true ||
+				requestParams.enableSearch === true ||
+				requestParams.enableUrlContext === true);
+		const requestOptedOut = this.envSettings.allowRequestControl && requestParams.enableNativeTools === false;
+
+		// Environment settings are the default, while explicitly allowed request controls can opt in or out.
+		if ((!this.envSettings.enableNativeTools && !requestOptedIn) || requestOptedOut) {
 			return this.createCustomOnlyConfig(customTools);
 		}
 

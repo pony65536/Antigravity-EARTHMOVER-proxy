@@ -1,5 +1,6 @@
 import { AUTO_SWITCH_MODEL_MAP, RATE_LIMIT_STATUS_CODES } from "../constants";
-import { Env, ChatMessage, UsageData, StreamChunk } from "../types";
+import { Env, ChatMessage, UsageData, StreamChunk, GeminiCompletionOptions } from "../types";
+import { UpstreamApiError } from "./openai-compat";
 
 /**
  * Helper class for handling automatic model switching on rate limit errors.
@@ -32,8 +33,9 @@ export class AutoModelSwitchingHelper {
 	 */
 	isRateLimitError(error: unknown): boolean {
 		return (
-			error instanceof Error &&
-			(error.message.includes("Stream request failed: 429") || error.message.includes("Stream request failed: 503"))
+			(error instanceof UpstreamApiError && (error.status === 429 || error.status === 503)) ||
+			(error instanceof Error &&
+				(error.message.includes("Stream request failed: 429") || error.message.includes("Stream request failed: 503")))
 		);
 	}
 
@@ -66,20 +68,12 @@ export class AutoModelSwitchingHelper {
 		originalModel: string,
 		systemPrompt: string,
 		messages: ChatMessage[],
-		options:
-			| {
-					includeReasoning?: boolean;
-					thinkingBudget?: number;
-			  }
-			| undefined,
+		options: GeminiCompletionOptions | undefined,
 		streamContentFn: (
 			modelId: string,
 			systemPrompt: string,
 			messages: ChatMessage[],
-			options?: {
-				includeReasoning?: boolean;
-				thinkingBudget?: number;
-			}
+			options?: GeminiCompletionOptions
 		) => AsyncGenerator<StreamChunk>
 	): Promise<{ content: string; usage?: UsageData } | null> {
 		const fallbackModel = this.getFallbackModel(originalModel);

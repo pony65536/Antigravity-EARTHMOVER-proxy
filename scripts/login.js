@@ -1,10 +1,12 @@
 import * as crypto from 'crypto';
 import * as readline from 'readline';
+import { writeFile } from 'node:fs/promises';
 
 const CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 const CLIENT_SECRET = "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";
 const REDIRECT_URI = "https://antigravity.google/oauth-callback";
 const SCOPES = "https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/experimentsandconfigs https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/cclog openid";
+const writeDevVars = process.argv.includes('--dev-vars');
 
 const rl = readline.createInterface({
     input: process.stdin,
@@ -83,9 +85,15 @@ async function login() {
                 expiry_date: 0
             };
 
-            console.log("\n✅ SUCCESS! Here is your GCP_SERVICE_ACCOUNT secret for Cloudflare:\n");
-            console.log(JSON.stringify(wranglerJson));
-            console.log("\nRun `npx wrangler secret put GCP_SERVICE_ACCOUNT` and paste the single line of JSON above.");
+            if (writeDevVars) {
+                const value = JSON.stringify(wranglerJson);
+                await writeFile('.dev.vars', `GCP_SERVICE_ACCOUNT='${value}'\n`, { encoding: 'utf8', mode: 0o600 });
+                console.log("\n✅ SUCCESS! Credentials were saved to the git-ignored .dev.vars file.");
+            } else {
+                console.log("\n✅ SUCCESS! Here is your GCP_SERVICE_ACCOUNT secret for Cloudflare:\n");
+                console.log(JSON.stringify(wranglerJson));
+                console.log("\nRun `npx wrangler secret put GCP_SERVICE_ACCOUNT` and paste the single line of JSON above.");
+            }
             
         } catch (e) {
             console.error("Error:", e.message);

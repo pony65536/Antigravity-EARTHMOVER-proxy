@@ -445,7 +445,8 @@ OpenAIRoute.post("/chat/completions", async (c) => {
 			includeReasoning,
 			reasoning_effort,
 			tools,
-			tool_choice
+			tool_choice,
+			maxOutputTokens: body.max_completion_tokens ?? body.max_tokens ?? null
 		});
 
 		// Unified media validation

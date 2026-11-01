@@ -845,8 +845,13 @@ export class GeminiApiClient {
 			}
 		}
 
-		const isNewModel = finalModelId.includes("3.6") || finalModelId.includes("3.7") || finalModelEnum === "MODEL_PLACEHOLDER_M73";
-		const defaultMaxTokens = geminiCliModels[finalModelId]?.maxTokens ?? (isNewModel ? 65536 : 16384);
+		// Dynamic model IDs (e.g. gemini-3.8-flash-tiered) are not in the
+		// static table. Falling back to 16384 truncated long answers and
+		// counted thinking tokens against the same budget, so allow the
+		// current generation limit for unknown models.
+		const defaultMaxTokens =
+			geminiCliModels[finalModelId]?.maxTokens ??
+			(finalModelId.startsWith("gpt-oss") ? 32000 : 65536);
 		const generationConfig = GenerationConfigValidator.createValidatedConfig(
 			finalModelId,
 			options,
@@ -1325,6 +1330,9 @@ export class GeminiApiClient {
 
 		try {
 		for await (const jsonData of this.parseSSEStream(response.body)) {
+			// Treat the generation timeout as an idle timeout: a long but
+			// healthy stream must not be aborted halfway through.
+			abortScope.reset();
 			if (jsonData.error) {
 				const upstreamStatus =
 					typeof jsonData.error.code === "number" && jsonData.error.code >= 400
@@ -1375,8 +1383,11 @@ export class GeminiApiClient {
 						continue; // Skip yielding this part as text if it's a thought part
 					}
 
-					// Check if text content contains <think> tags (e.g. for models that don't use part.thought)
-					if (part.text && (part.text.includes("<think>") || isThinking)) {
+					// Inline <think> tags are only an explicit opt-in format. Gemini
+					// reports real thinking via part.thought; a literal "<think>"
+					// inside normal text (e.g. a code sample) must not swallow the
+					// rest of the answer.
+					if (realThinkingAsContent && part.text && (part.text.includes("<think>") || isThinking)) {
 						let text = part.text;
 						
 						if (part.text.includes("<think>")) {
@@ -1624,7 +1635,9 @@ export class GeminiApiClient {
 			}
 
 			// Clean any inline <think> tags from content in non-streaming mode.
-			if (content.includes("<think>")) {
+			// Only treat them as reasoning when the answer actually starts with
+			// one; a literal "<think>" inside prose or code must be preserved.
+			if (content.trimStart().startsWith("<think>")) {
 				const thinkMatches = Array.from(content.matchAll(/<think>([\s\S]*?)<\/think>/g));
 				if (thinkMatches.length > 0 && !reasoningContent) {
 					reasoningContent = thinkMatches.map((match) => match[1].trim()).join("\n\n");
@@ -1632,8 +1645,8 @@ export class GeminiApiClient {
 				content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim();
 			}
 
-			// Also clean any unclosed <think> or leftover tags.
-			if (content.includes("<think>")) {
+			// Also clean any unclosed <think> or leftover tags at the start.
+			if (content.trimStart().startsWith("<think>")) {
 				const parts = content.split("<think>");
 				content = parts[0].trim();
 				if (!reasoningContent && parts[1]) {

@@ -16,6 +16,8 @@ export const TOKEN_REFRESH_TIMEOUT_MS = 15 * 1000;
 export const TOKEN_REFRESH_MAX_ATTEMPTS = 3;
 export const MODEL_DISCOVERY_TIMEOUT_MS = 10 * 1000;
 export const PROJECT_DISCOVERY_TIMEOUT_MS = 10 * 1000;
+// Idle timeout for the upstream generation stream. It is reset for every
+// SSE event, so long responses are not cut off as long as data keeps flowing.
 export const GENERATION_TIMEOUT_MS = 10 * 60 * 1000;
 export const DYNAMIC_MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 export const DYNAMIC_MODEL_STALE_TTL_MS = 24 * 60 * 60 * 1000;

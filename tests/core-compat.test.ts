@@ -195,6 +195,63 @@ test("streaming emits role, finish, an optional standalone usage chunk, and DONE
   }
 });
 
+test("literal <think> text in a streamed answer is not swallowed as reasoning", async () => {
+  const mock = installUpstreamMock("STOP", "before <think> literal tag after");
+  try {
+    const response = await app.request(
+      "http://localhost/v1/chat/completions",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "gemini-3.8-flash-tiered",
+          messages: [{ role: "user", content: "hi" }],
+          stream: true,
+        }),
+      },
+      testEnv(),
+    );
+
+    assert.equal(response.status, 200);
+    const events = parseSse(await response.text()) as Array<Record<string, any>>;
+    const content = events
+      .filter((event) => event !== "[DONE]")
+      .flatMap((event) => event.choices ?? [])
+      .map((choice) => choice.delta?.content ?? "")
+      .join("");
+    assert.equal(content, "before <think> literal tag after");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("unknown dynamic models get the current output budget instead of 16k", async () => {
+  const mock = installUpstreamMock("STOP", "ok");
+  try {
+    await app.request(
+      "http://localhost/v1/chat/completions",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "gemini-3.8-flash-tiered",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      },
+      testEnv(),
+    );
+
+    const generationRequest = mock.requests.find((request) =>
+      request.url.includes(":streamGenerateContent"),
+    );
+    assert.ok(generationRequest);
+    const body = JSON.parse(String(generationRequest.init?.body));
+    assert.equal(body.request.generationConfig.maxOutputTokens, 65536);
+  } finally {
+    mock.restore();
+  }
+});
+
 test("stream transformer omits usage when it was not requested", async () => {
   const chunks: StreamChunk[] = [
     { type: "text", data: "ok" },

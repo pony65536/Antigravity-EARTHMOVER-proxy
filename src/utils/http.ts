@@ -26,7 +26,13 @@ export function envTimeoutMs(env: Record<string, unknown> | undefined, key: stri
 export function createAbortScope(
 	timeoutMs: number,
 	parentSignal?: AbortSignal,
-): { signal: AbortSignal; cleanup: () => void; didTimeout: () => boolean } {
+): {
+	signal: AbortSignal;
+	cleanup: () => void;
+	didTimeout: () => boolean;
+	/** Restart the timeout; used to turn a total timeout into an idle timeout. */
+	reset: () => void;
+} {
 	const controller = new AbortController();
 	let timedOut = false;
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -43,12 +49,15 @@ export function createAbortScope(
 		}
 	}
 
-	if (timeoutMs > 0) {
+	const reset = () => {
+		if (timeoutMs <= 0) return;
+		if (timer) clearTimeout(timer);
 		timer = setTimeout(() => {
 			timedOut = true;
 			controller.abort(new RequestTimeoutError(timeoutMs));
 		}, timeoutMs);
-	}
+	};
+	reset();
 
 	return {
 		signal: controller.signal,
@@ -57,6 +66,7 @@ export function createAbortScope(
 			parentSignal?.removeEventListener("abort", onParentAbort);
 		},
 		didTimeout: () => timedOut,
+		reset,
 	};
 }
 

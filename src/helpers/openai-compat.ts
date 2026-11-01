@@ -4,7 +4,12 @@ import {
   ChatCompletionUsage,
 } from "../types";
 import { isAbortError } from "../utils/http";
-import { SchemaConversionError, convertSchemaForGemini, selectSchemaProtocol } from "./structured-output";
+import {
+  SchemaConversionError,
+  convertSchemaForGemini,
+  convertToolSchemaForGemini,
+  selectSchemaProtocol,
+} from "./structured-output";
 
 export interface ValidationIssue {
   message: string;
@@ -158,8 +163,9 @@ function validateToolDefinition(
       };
     }
     try {
-      // Validate the same Gemini subset used for function declarations.
-      convertSchemaForGemini(fn.parameters, "responseSchema");
+      // Tool declarations are sanitized rather than rejected: clients send
+      // JSON Schema keywords that Gemini's function subset cannot represent.
+      convertToolSchemaForGemini(fn.parameters);
     } catch (error: unknown) {
       if (error instanceof SchemaConversionError) {
         return {

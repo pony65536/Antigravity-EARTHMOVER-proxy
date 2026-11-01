@@ -3,6 +3,7 @@ import test from "node:test";
 import { GenerationConfigValidator } from "../src/helpers/generation-config-validator";
 import {
   convertSchemaForGemini,
+  convertToolSchemaForGemini,
   SchemaConversionError,
   selectSchemaProtocol,
   validateStructuredOutputText,
@@ -112,6 +113,47 @@ test("unsupported schema features fail loudly instead of being dropped", () => {
     "responseJsonSchema",
   );
   assert.equal(jsonSchema.exclusiveMinimum, 1);
+});
+
+test("tool schemas are sanitized instead of rejected", () => {
+  const parameters = {
+    type: "object",
+    properties: {
+      limit: { type: "integer", exclusiveMinimum: 0, exclusiveMaximum: 100 },
+      tags: { type: "array", items: { type: "string" }, uniqueItems: true },
+      mode: { type: "string", enum: ["a", "b"], strict: true },
+      filter: { type: "object", additionalProperties: true },
+      query: { type: "string", pattern: "^[a-z]+$" },
+    },
+    required: ["query"],
+    additionalProperties: false,
+  };
+
+  const converted = convertToolSchemaForGemini(parameters) as any;
+  assert.equal(converted.properties.limit.type, "INTEGER");
+  assert.equal(converted.properties.limit.exclusiveMinimum, undefined);
+  assert.equal(converted.properties.limit.exclusiveMaximum, undefined);
+  assert.equal(converted.properties.tags.uniqueItems, undefined);
+  assert.equal(converted.properties.mode.strict, undefined);
+  assert.deepEqual(converted.properties.mode.enum, ["a", "b"]);
+  assert.equal(converted.properties.filter.additionalProperties, undefined);
+  assert.equal(converted.properties.query.pattern, "^[a-z]+$");
+  assert.equal(converted.additionalProperties, undefined);
+
+  assert.equal(
+    validateChatCompletionRequest({
+      messages: [{ role: "user", content: "search" }],
+      tools: [{ type: "function", function: { name: "search", parameters } }],
+    }),
+    null,
+  );
+
+  const config = GenerationConfigValidator.createValidateTools({
+    tools: [{ type: "function", function: { name: "search", parameters } }],
+  });
+  const declaration = (config.tools[0] as any).functionDeclarations[0];
+  assert.equal(declaration.parameters.properties.limit.exclusiveMinimum, undefined);
+  assert.equal(declaration.parameters.properties.limit.type, "INTEGER");
 });
 
 test("structured output validation rejects parse errors and schema violations", () => {

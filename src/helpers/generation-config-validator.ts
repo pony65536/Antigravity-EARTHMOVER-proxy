@@ -9,6 +9,7 @@ import { ChatCompletionRequest, Env, EffortLevel, SafetyThreshold } from "../typ
 import { NativeToolsConfiguration } from "../types/native-tools";
 import {
 	convertSchemaForGemini,
+	convertToolSchemaForGemini,
 	selectSchemaProtocol,
 	SchemaProtocol
 } from "./structured-output";
@@ -209,7 +210,7 @@ export class GenerationConfigValidator {
 		if (Array.isArray(options.tools) && options.tools.length > 0) {
 			const functionDeclarations = options.tools.map((tool) => {
 				const parameters = tool.function.parameters
-					? convertSchemaForGemini(tool.function.parameters, "responseSchema")
+					? convertToolSchemaForGemini(tool.function.parameters)
 					: undefined;
 				return {
 					name: tool.function.name,

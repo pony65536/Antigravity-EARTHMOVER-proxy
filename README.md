@@ -90,7 +90,7 @@ The proxy now exposes both OpenAI completion surfaces:
 - `POST /v1/completions` (legacy text completions, streaming and non-streaming)
 - `GET /v1/models` and `GET /v1/models/:model`
 
-V2 adds strict request validation, schema conversion with explicit errors for unsupported keywords, parallel tool calls with preserved IDs, bounded OAuth refresh retries, independent upstream timeouts, per-account model/project caches, `Retry-After` handling, request-ID preservation, and cancellation propagation when the client disconnects.
+V2 adds strict request validation, strict schema conversion for structured output with explicit errors for unsupported keywords, automatic sanitization for tool schemas, parallel tool calls with preserved IDs, bounded OAuth refresh retries, independent upstream timeouts, per-account model/project caches, `Retry-After` handling, request-ID preservation, and cancellation propagation when the client disconnects.
 
 Two provider-specific notes:
 

@@ -2,6 +2,14 @@ type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string
 
 export type SchemaProtocol = "responseSchema" | "responseJsonSchema";
 
+/**
+ * Strict mode rejects schemas with keywords Gemini cannot represent. Lenient
+ * mode drops those keywords instead, which is what tool declarations need:
+ * clients such as OpenCode send valid JSON Schema that Gemini's function
+ * declaration subset does not accept verbatim.
+ */
+export type SchemaConversionMode = "strict" | "lenient";
+
 export class SchemaConversionError extends Error {
 	constructor(
 		message: string,
@@ -130,6 +138,20 @@ function assertNoUnsupportedKey(key: string, protocol: SchemaProtocol, path: str
 	}
 }
 
+function shouldDropUnsupportedKey(
+	key: string,
+	protocol: SchemaProtocol,
+	mode: SchemaConversionMode,
+): boolean {
+	if (METADATA_KEYS.has(key)) return true;
+	if (mode === "strict") return false;
+	return (
+		REJECTED_SCHEMA_KEYS.has(key) ||
+		(JSON_SCHEMA_ONLY_KEYS.has(key) && protocol === "responseSchema") ||
+		!SUPPORTED_KEYS.has(key)
+	);
+}
+
 function inferTypeFromEnum(values: unknown[]): string | undefined {
 	if (values.length === 0) return undefined;
 	if (values.every((value) => typeof value === "string")) return "string";
@@ -138,7 +160,12 @@ function inferTypeFromEnum(values: unknown[]): string | undefined {
 	return undefined;
 }
 
-function convertType(type: unknown, protocol: SchemaProtocol, path: string): JsonValue {
+function convertType(
+	type: unknown,
+	protocol: SchemaProtocol,
+	path: string,
+	mode: SchemaConversionMode,
+): JsonValue {
 	if (typeof type === "string") {
 		return protocol === "responseSchema" ? type.toUpperCase() : type;
 	}
@@ -146,6 +173,9 @@ function convertType(type: unknown, protocol: SchemaProtocol, path: string): Jso
 		if (protocol === "responseSchema") {
 			const nonNull = type.filter((entry) => entry !== "null");
 			if (nonNull.length !== 1) {
+				if (mode === "lenient" && nonNull.length > 0) {
+					return String(nonNull[0]).toUpperCase();
+				}
 				throw new SchemaConversionError(
 					"Union types must be expressed with anyOf when using Gemini responseSchema",
 					"unsupported_json_schema",
@@ -164,11 +194,13 @@ function convertNode(
 	protocol: SchemaProtocol,
 	path: string,
 	depth: number,
+	mode: SchemaConversionMode,
 ): JsonValue {
 	if (depth > 64) {
 		throw new SchemaConversionError("JSON schema nesting is too deep", "invalid_json_schema", path);
 	}
 	if (typeof node === "boolean") {
+		if (mode === "lenient") return {};
 		throw new SchemaConversionError(
 			"Boolean JSON schemas are not supported",
 			"unsupported_json_schema",
@@ -191,7 +223,7 @@ function convertNode(
 		if (Array.isArray(typeValue) && typeValue.includes("null")) {
 			nullable = true;
 			const nonNull = typeValue.filter((entry) => entry !== "null");
-			if (nonNull.length !== 1) {
+			if (nonNull.length !== 1 && mode === "strict") {
 				throw new SchemaConversionError(
 					"Union types must be expressed with anyOf when using Gemini responseSchema",
 					"unsupported_json_schema",
@@ -210,7 +242,7 @@ function convertNode(
 				anyOfValue = anyOfValue.filter(
 					(branch) => !(isRecord(branch) && branch.type === "null"),
 				);
-				if ((anyOfValue as unknown[]).length === 0) {
+				if ((anyOfValue as unknown[]).length === 0 && mode === "strict") {
 					throw new SchemaConversionError(
 						"anyOf must contain at least one non-null schema",
 						"invalid_json_schema",
@@ -245,13 +277,17 @@ function convertNode(
 
 	for (const [key, value] of Object.entries(node)) {
 		if (handled.has(key)) continue;
+		if (mode === "lenient" && shouldDropUnsupportedKey(key, protocol, mode)) {
+			handled.add(key);
+			continue;
+		}
 		assertNoUnsupportedKey(key, protocol, path);
 
 		if (METADATA_KEYS.has(key)) continue;
 
 		switch (key) {
 			case "type":
-				converted.type = convertType(typeValue, protocol, path);
+				converted.type = convertType(typeValue, protocol, path, mode);
 				handled.add(key);
 				break;
 			case "nullable":
@@ -264,7 +300,7 @@ function convertNode(
 				}
 				if (!typeValue && !anyOfValue) {
 					const inferred = inferTypeFromEnum(enumValue);
-					if (inferred) converted.type = convertType(inferred, protocol, path);
+					if (inferred) converted.type = convertType(inferred, protocol, path, mode);
 				}
 				converted.enum = enumValue as JsonValue[];
 				handled.add(key);
@@ -280,6 +316,10 @@ function convertNode(
 				break;
 			case "anyOf": {
 				if (!Array.isArray(anyOfValue) || anyOfValue.length === 0) {
+					if (mode === "lenient") {
+						handled.add(key);
+						break;
+					}
 					throw new SchemaConversionError(
 						"Schema 'anyOf' must be a non-empty array",
 						"invalid_json_schema",
@@ -287,7 +327,7 @@ function convertNode(
 					);
 				}
 				converted.anyOf = (anyOfValue as unknown[]).map((branch, index) =>
-					convertNode(branch, protocol, `${path}.anyOf[${index}]`, depth + 1),
+					convertNode(branch, protocol, `${path}.anyOf[${index}]`, depth + 1, mode),
 				);
 				handled.add(key);
 				break;
@@ -307,6 +347,7 @@ function convertNode(
 						protocol,
 						`${path}.properties.${propertyName}`,
 						depth + 1,
+						mode,
 					);
 				}
 				converted.properties = properties;
@@ -327,27 +368,38 @@ function convertNode(
 			}
 			case "items": {
 				if (Array.isArray(value)) {
+					if (mode === "lenient") {
+						converted.items = convertNode(
+							value[0] ?? {},
+							protocol,
+							`${path}.items`,
+							depth + 1,
+							mode,
+						);
+						handled.add(key);
+						break;
+					}
 					throw new SchemaConversionError(
 						"Tuple-style array items are not supported",
 						"unsupported_json_schema",
 						`${path}.items`,
 					);
 				}
-				converted.items = convertNode(value, protocol, `${path}.items`, depth + 1);
+				converted.items = convertNode(value, protocol, `${path}.items`, depth + 1, mode);
 				handled.add(key);
 				break;
 			}
 			case "additionalProperties": {
 				if (responseSchema) {
-					if (value !== false) {
+					if (value !== false && mode === "strict") {
 						throw new SchemaConversionError(
 							"Open additional properties are not supported by Gemini responseSchema",
 							"unsupported_json_schema",
 							`${path}.additionalProperties`,
 						);
 					}
-					// Gemini object schemas are closed by default; dropping false is
-					// equivalent and avoids silently accepting an open object.
+					// Gemini object schemas are closed by default; dropping false (or
+					// dropping true in lenient tool mode) is the closest equivalent.
 				} else if (typeof value === "boolean") {
 					converted.additionalProperties = value;
 				} else {
@@ -356,6 +408,7 @@ function convertNode(
 						protocol,
 						`${path}.additionalProperties`,
 						depth + 1,
+						mode,
 					);
 				}
 				handled.add(key);
@@ -390,15 +443,25 @@ function convertNode(
 export function convertSchemaForGemini(
 	schema: unknown,
 	protocol: SchemaProtocol,
+	mode: SchemaConversionMode = "strict",
 ): Record<string, unknown> {
 	if (!isRecord(schema)) {
 		throw new SchemaConversionError("Schema must be an object", "invalid_json_schema", "$");
 	}
-	const converted = convertNode(schema, protocol, "$", 0);
+	const converted = convertNode(schema, protocol, "$", 0, mode);
 	if (!isRecord(converted)) {
 		throw new SchemaConversionError("Schema conversion failed", "invalid_json_schema", "$");
 	}
 	return converted;
+}
+
+/**
+ * Tool declarations use Gemini's OpenAPI-style responseSchema subset, but
+ * clients are allowed to send richer JSON Schema. Sanitize unsupported
+ * keywords instead of rejecting the whole request.
+ */
+export function convertToolSchemaForGemini(schema: unknown): Record<string, unknown> {
+	return convertSchemaForGemini(schema, "responseSchema", "lenient");
 }
 
 export function assertSupportedSchema(
